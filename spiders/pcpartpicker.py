@@ -95,7 +95,7 @@ class PCPartPickerSpider(BaseSpider):
                     url = f"{self.base_url}{url_path}"
 
                     # Crawl lên đến 15 trang (theo yêu cầu user)
-                    for page_num in range(1, 16):
+                    for page_num in range(1, 2):
                         page_url = f"{url}#page={page_num}"
                         logger.info(f"[{self.name}] Trang {page_num}: Điều hướng tới {page_url}...")
                         dp_page.get(page_url)
