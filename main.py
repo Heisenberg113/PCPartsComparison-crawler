@@ -36,7 +36,7 @@ async def run_crawl():
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                channel="msedge",
+                # channel="msedge",
                 headless=False,
                 args=[
                     "--disable-blink-features=AutomationControlled",

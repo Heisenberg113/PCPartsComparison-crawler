@@ -20,8 +20,8 @@ def get_connection():
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
-        dbname=os.getenv("DB_NAME", "pcparts"),
-        user=os.getenv("DB_USER", "pcparts_user"),
+        dbname=os.getenv("DB_DATABASE", "pcparts"),
+        user=os.getenv("DB_USERNAME", "pcparts_user"),
         password=os.getenv("DB_PASSWORD", "pcparts_secret_2024"),
         cursor_factory=RealDictCursor,
     )
@@ -34,7 +34,13 @@ def save_product(conn, product_data: dict):
     """
     # Generate embedding text
     text_to_embed = f"{product_data.get('category', '')} {product_data.get('brand', '')} {product_data.get('name', '')} {json.dumps(product_data.get('specs', {}))} {product_data.get('description', '')}"
-    embedding_vector = embedder.generate_embedding(text_to_embed)
+    
+    try:
+        embedding_vector = embedder.generate_embedding(text_to_embed)
+        embedding_value = str(embedding_vector)
+    except Exception as e:
+        print(f"Error generating embedding for {product_data.get('slug', 'unknown')}: {e}")
+        embedding_value = None
 
     with conn.cursor() as cur:
         cur.execute(
@@ -47,14 +53,14 @@ def save_product(conn, product_data: dict):
                 image_url = EXCLUDED.image_url,
                 description = EXCLUDED.description,
                 base_price = EXCLUDED.base_price,
-                embedding = EXCLUDED.embedding,
+                embedding = COALESCE(EXCLUDED.embedding, products.embedding),
                 updated_at = NOW()
             RETURNING id
             """,
             {
                 **product_data,
                 "specs": Json(product_data.get("specs", {})),
-                "embedding": str(embedding_vector),  # store as pgvector compatible string representation or list
+                "embedding": embedding_value,
             },
         )
         product_id = cur.fetchone()["id"]
