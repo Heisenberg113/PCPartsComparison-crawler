@@ -32,12 +32,13 @@ class TechPowerUpSpider(BaseSpider):
                 raise RateLimitError(f"Rate limit detected (title: {page_title}) tại {url}")
             data = await page.evaluate("""
                 () => {
-                    const getDtValue = (label) => {
+                    const getDtValue = (label, keepHtml = false) => {
                         const dts = Array.from(document.querySelectorAll('section.details dl dt'));
                         for (let dt of dts) {
                             if (dt.textContent.trim().toLowerCase().includes(label.toLowerCase())) {
                                 const dd = dt.nextElementSibling;
-                                return dd ? dd.innerText.trim() : '';
+                                if (!dd) return '';
+                                return keepHtml ? dd.innerHTML.trim() : dd.innerText.trim();
                             }
                         }
                         return '';
@@ -48,15 +49,15 @@ class TechPowerUpSpider(BaseSpider):
                     };
                     const getName = () => {
                         const name = document.querySelector('h1.gpudb-name'); 
-                        return name ? name.textContent.trim() : '';
+                        return name ? name.innerHTML.trim() : '';
                     };
                     const getBrand = () => {
                         const name = document.querySelector('h1.gpudb-name'); 
-                        return name ? name.textContent.trim().split(" ")[0] : '';
+                        return name ? name.innerHTML.trim().split(" ")[0] : '';
                     };
                     const getDescription = () => {
                         const el = document.querySelector('div.desc.p');
-                        return el ? el.innerText : '';
+                        return el ? el.innerHTML.trim() : '';
                     };
                         
                     const vgaName = getName() || 'Unknown GPU';
@@ -71,12 +72,12 @@ class TechPowerUpSpider(BaseSpider):
                     const memType = getDtValue('Memory Type') || 'N/A';
                     const memBus = getDtValue('Memory Bus') || 'N/A';
                     const memBandwidth = getDtValue('Memory Bandwidth') || 'N/A';
-                    const baseClock = getDtValue('Base Clock') || 'N/A';
-                    const boostClock = getDtValue('Boost Clock') || 'N/A';
-                    const memClock = getDtValue('Memory Clock') || 'N/A';
-                    const tdp = getDtValue('TDP') || 'N/A';
-                    const powerConnectors = getDtValue('Power Connectors') || 'N/A';
-                    const slotWidth = getDtValue('Slot Width') || 'N/A';
+                    const baseClock = getDtValue('Base Clock', true) || 'N/A';
+                    const boostClock = getDtValue('Boost Clock', true) || 'N/A';
+                    const memClock = getDtValue('Memory Clock', true) || 'N/A';
+                    const tdp = getDtValue('TDP', true) || 'N/A';
+                    const powerConnectors = getDtValue('Power Connectors', true) || 'N/A';
+                    const slotWidth = getDtValue('Slot Width', true) || 'N/A';
                     const shadingUnits = getDtValue('Shading Units') || 'N/A';
                     const imgUrl = getImageUrl();
 

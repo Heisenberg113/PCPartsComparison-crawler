@@ -70,3 +70,38 @@ def find_product_by_slug(conn, slug: str):
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM products WHERE slug = %s", (slug,))
         return cur.fetchone()
+
+
+def save_products_batch(conn, products_data: list):
+    """
+    Lưu hoặc cập nhật một batch sản phẩm vào database.
+    """
+    if not products_data:
+        return []
+
+    ids = []
+    with conn.cursor() as cur:
+        for product_data in products_data:
+            cur.execute(
+                """
+                INSERT INTO products (name, slug, category, brand, specs, image_url, description, base_price)
+                VALUES (%(name)s, %(slug)s, %(category)s, %(brand)s, %(specs)s, %(image_url)s, %(description)s, %(base_price)s)
+                ON CONFLICT (slug) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    specs = EXCLUDED.specs,
+                    image_url = EXCLUDED.image_url,
+                    description = EXCLUDED.description,
+                    base_price = EXCLUDED.base_price,
+                    updated_at = NOW()
+                RETURNING id
+                """,
+                {
+                    **product_data,
+                    "specs": Json(product_data.get("specs", {})),
+                },
+            )
+            res = cur.fetchone()
+            if res:
+                ids.append(res["id"])
+        conn.commit()
+    return ids

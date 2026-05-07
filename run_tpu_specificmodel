@@ -1,0 +1,281 @@
+import sys
+import os
+import asyncio
+import logging
+from playwright.async_api import async_playwright
+from dotenv import load_dotenv
+from deep_translator import GoogleTranslator
+
+from db import get_connection, save_products_batch
+from spiders.techpowerup import TechPowerUpSpider, RateLimitError
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("techpowerup_runner")
+
+def get_proxy_config():
+    """Lấy cấu hình proxy từ .env (nếu có)"""
+    host = os.getenv("PROXY_HOST")
+    port = os.getenv("PROXY_PORT")
+    user = os.getenv("PROXY_USER")
+    pw   = os.getenv("PROXY_PASS")
+    if host and port:
+        proxy = {"server": f"http://{host}:{port}"}
+        if user:
+            proxy["username"] = user
+        if pw:
+            proxy["password"] = pw
+        return proxy
+    return None
+
+def translate_product(product: dict) -> dict:
+    """Dịch các trường thông tin quan trọng từ tiếng Anh sang tiếng Việt"""
+    translator = GoogleTranslator(source='en', target='vi')
+    try:
+        if product.get('description'):
+            try:
+                # API limit check per request is about 5000 chars, usually description is short
+                product['description'] = translator.translate(product['description'])
+            except Exception as e:
+                logger.warning(f"Translation warning for description of {product.get('name', '')}: {e}")
+                
+        if 'specs' in product and isinstance(product['specs'], dict):
+            for k, v in product['specs'].items():
+                if isinstance(v, str) and v and v != 'N/A' and not v.replace('.','',1).isdigit():
+                    try:
+                        product['specs'][k] = translator.translate(v)
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Translation error for {product.get('name', '')}: {e}")
+    return product
+
+
+RATE_LIMIT_WAIT = 30  # Số giây đợi khi bị rate limit để proxy rotate IP
+MAX_RETRIES = 3       # Số lần retry tối đa cho mỗi URL bị rate limit
+
+async def create_browser_and_page(p, spider, proxy_config):
+    """Tạo browser + context + page mới (để lấy IP proxy mới)"""
+    launch_opts = {
+        "channel": "msedge",
+        "headless": True,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+    }
+    if proxy_config:
+        launch_opts["proxy"] = proxy_config
+
+    browser = await p.chromium.launch(**launch_opts)
+    context = await browser.new_context(
+        user_agent=spider.get_random_user_agent(),
+        viewport={"width": 1920, "height": 1080},
+        java_script_enabled=True,
+        locale="en-US",
+    )
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    """)
+    page = await context.new_page()
+    return browser, context, page
+
+async def _check_rate_limit(page, response, url: str):
+    """Kiểm tra rate limit từ response status và page title. Raise RateLimitError nếu phát hiện."""
+    if response and response.status == 429:
+        raise RateLimitError(f"HTTP 429 tại {url}")
+    page_title = await page.title()
+    if "too many" in page_title.lower() or "rate limit" in page_title.lower():
+        raise RateLimitError(f"Rate limit detected (title: {page_title}) tại {url}")
+
+async def get_gpu_links(p, page, browser, spider, proxy_config) -> tuple[list[str], object, object]:
+    """Lấy danh sách GPU links. Trả về (links, browser, page) vì browser có thể được tạo lại khi bị rate limit."""
+    base_url = f"https://www.techpowerup.com/gpu-specs/"
+
+    # --- Lấy danh sách gpu (có rate limit detection) ---
+    retries = 0
+    gpu_url = None
+    while retries <= MAX_RETRIES:
+        try:
+            response = await page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
+            if response and response.status == 404:
+                logger.warning(f"Không truy cập được vào {base_url}")
+                return [], browser, page
+
+            await _check_rate_limit(page, response, base_url)
+
+            # Đợi page load hoàn toàn và đợi link selector xuất hiện
+            await page.wait_for_load_state('networkidle')
+            await page.wait_for_selector('div.item-name a', timeout=15000)
+            gpu_url = await page.evaluate("""
+                () => {
+                    const gpus = document.querySelectorAll('div.item-name a'); 
+                    return Array.from(gpus, a => a.href)
+                }
+            """)
+            logger.info(f"📄 Tìm thấy {len(gpu_url)} gpu links trên trang chính")
+            break  # Thành công, thoát vòng lặp
+        except RateLimitError as rle:
+            retries += 1
+            logger.warning(f"⏳ Rate limit khi lấy danh sách gpu: {rle}")
+            if retries > MAX_RETRIES:
+                logger.error(f"❌ Bỏ qua lấy danh sách gpu sau {MAX_RETRIES} lần retry")
+                return [], browser, page
+            logger.info(f"🔄 Đợi {RATE_LIMIT_WAIT}s để proxy rotate IP... (retry {retries}/{MAX_RETRIES})")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            await asyncio.sleep(RATE_LIMIT_WAIT)
+            browser, _, page = await create_browser_and_page(p, spider, proxy_config)
+            logger.info(f"🌐 Đã tạo kết nối mới, tiếp tục lấy gpu...")
+
+    if not gpu_url:
+        return [], browser, page
+
+    # --- Lấy link GPU từ từng gpu (có rate limit detection) ---
+    all_links = []
+
+    for gpu in gpu_url[1:2]:
+        retries = 0
+        success = False
+
+        while retries <= MAX_RETRIES and not success:
+            try:
+                gen_url = f"{gpu}"
+                response = await page.goto(gen_url, wait_until="domcontentloaded", timeout=20000)
+                await _check_rate_limit(page, response, gen_url)
+
+                # Đợi page load hoàn toàn và đợi link selector xuất hiện
+                await page.wait_for_load_state('networkidle')
+                logger.info(f"Đang lấy link từ {gpu}")
+                try:
+                    await page.wait_for_selector('div.board-table-title__inner a', timeout=15000)
+                except Exception:
+                    logger.warning(f"⚠️ Không tìm thấy link selector trên {gpu}")
+                    success = True
+                    continue
+                links = await page.evaluate("""
+                    () => {
+                        const gpus = document.querySelectorAll('div.board-table-title__inner a'); 
+                        return Array.from(gpus, a => a.href)
+                    }
+                """)
+                links = list(set(links))
+                all_links.extend(links)
+                logger.info(f"Đã lấy được {len(links)} link từ {gpu} (tổng: {len(all_links)})")
+                success = True
+
+            except RateLimitError as rle:
+                retries += 1
+                logger.warning(f"⏳ Rate limit khi lấy link gpu '{gpu}': {rle}")
+                if retries > MAX_RETRIES:
+                    logger.error(f"❌ Bỏ qua gpu '{gpu}' sau {MAX_RETRIES} lần retry")
+                    break
+                logger.info(f"🔄 Đợi {RATE_LIMIT_WAIT}s để proxy rotate IP... (retry {retries}/{MAX_RETRIES})")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(RATE_LIMIT_WAIT)
+                browser, _, page = await create_browser_and_page(p, spider, proxy_config)
+                logger.info(f"🌐 Đã tạo kết nối mới, tiếp tục lấy link...")
+
+            except Exception as e:
+                logger.error(f"❌ Lỗi khi lấy link từ gpu '{gpu}': {e}")
+                success = True  # Bỏ qua, không retry lỗi khác
+
+        spider.random_delay()
+
+    return list(set(all_links)), browser, page
+
+
+async def run():
+    proxy_config = get_proxy_config()
+    if proxy_config:
+        logger.info(f"🌐 Proxy enabled: {proxy_config['server']}")
+    else:
+        logger.info("⚠️ No proxy configured, using direct connection")
+
+    logger.info(f"🚀 Starting TechPowerUp Crawler")
+    spider = TechPowerUpSpider()
+    conn = get_connection()
+    try:
+        async with async_playwright() as p:
+            browser, context, page = await create_browser_and_page(p, spider, proxy_config)
+
+            gpu_links, browser, page = await get_gpu_links(p, page, browser, spider, proxy_config)
+            logger.info(f"📋 Tổng cộng {len(gpu_links)} GPU links cần crawl")
+
+            batch_size = 100
+            products_batch = []
+
+            for idx, gpu_link in enumerate(gpu_links, 1):
+                retries = 0
+                success = False
+
+                while retries <= MAX_RETRIES and not success:
+                    try:
+                        product = await spider.get_details(page, gpu_link)
+
+                        if product:
+                            # Dịch ra tiếng việt trước khi lưu
+                            product = translate_product(product)
+                            products_batch.append(product)
+                            logger.info(f"⏳ [{idx}/{len(gpu_links)}] Crawled and translated GPU: {product['name']}")
+
+                            if len(products_batch) >= batch_size or idx == len(gpu_links):
+                                try:
+                                    ids = save_products_batch(conn, products_batch)
+                                    logger.info(f"✅ Saved batch of {len(products_batch)} GPUs (IDs count: {len(ids)})")
+                                    products_batch = []
+                                except Exception as db_err:
+                                    logger.error(f"❌ DB Error saving batch: {db_err}")
+                                    conn.rollback()
+                                    products_batch = []
+                        success = True
+
+                    except RateLimitError as rle:
+                        retries += 1
+                        logger.warning(f"⏳ [{idx}/{len(gpu_links)}] Rate limit detected: {rle}")
+                        if retries > MAX_RETRIES:
+                            logger.error(f"❌ Bỏ qua {gpu_link} sau {MAX_RETRIES} lần retry")
+                            break
+
+                        logger.info(f"🔄 Đợi {RATE_LIMIT_WAIT}s để proxy rotate IP... (retry {retries}/{MAX_RETRIES})")
+                        # Đóng browser cũ để giải phóng kết nối proxy
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(RATE_LIMIT_WAIT)
+
+                        # Tạo browser mới → kết nối proxy mới → IP mới
+                        browser, context, page = await create_browser_and_page(p, spider, proxy_config)
+                        logger.info(f"🌐 Đã tạo kết nối mới, tiếp tục crawl...")
+
+                    except Exception as crawl_err:
+                        logger.error(f"❌ Crawl Error for {gpu_link}: {crawl_err}")
+                        success = True  # Không retry lỗi khác, bỏ qua
+
+                # Tránh gọi request dồn dập
+                spider.random_delay()
+
+            await browser.close()
+
+    except Exception as e:
+        logger.error(f"🔥 Critical crawler error: {e}")
+    finally:
+        conn.close()
+        logger.info("🛑 Crawler finished")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped by user (Ctrl+C)")
