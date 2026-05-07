@@ -38,7 +38,7 @@ MAX_RETRIES = 3       # Số lần retry tối đa cho mỗi URL bị rate limit
 async def create_browser_and_page(p, spider, proxy_config):
     """Tạo browser + context + page mới (để lấy IP proxy mới)"""
     launch_opts = {
-        "channel": "msedge",
+        # "channel": "msedge",
         "headless": False,
         "args": [
             "--disable-blink-features=AutomationControlled",
