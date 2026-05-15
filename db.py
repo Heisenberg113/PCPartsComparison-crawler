@@ -45,8 +45,8 @@ def save_product(conn, product_data: dict):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO products (name, slug, category, brand, specs, image_url, description, base_price, embedding)
-            VALUES (%(name)s, %(slug)s, %(category)s, %(brand)s, %(specs)s, %(image_url)s, %(description)s, %(base_price)s, %(embedding)s)
+            INSERT INTO products (name, slug, category, brand, specs, image_url, description, base_price, embedding, ext_rating, ext_review_count)
+            VALUES (%(name)s, %(slug)s, %(category)s, %(brand)s, %(specs)s, %(image_url)s, %(description)s, %(base_price)s, %(embedding)s, %(ext_rating)s, %(ext_review_count)s)
             ON CONFLICT (slug) DO UPDATE SET
                 name = EXCLUDED.name,
                 specs = EXCLUDED.specs,
@@ -54,6 +54,8 @@ def save_product(conn, product_data: dict):
                 description = EXCLUDED.description,
                 base_price = EXCLUDED.base_price,
                 embedding = COALESCE(EXCLUDED.embedding, products.embedding),
+                ext_rating = COALESCE(EXCLUDED.ext_rating, products.ext_rating),
+                ext_review_count = COALESCE(EXCLUDED.ext_review_count, products.ext_review_count),
                 updated_at = NOW()
             RETURNING id
             """,
@@ -61,6 +63,8 @@ def save_product(conn, product_data: dict):
                 **product_data,
                 "specs": Json(product_data.get("specs", {})),
                 "embedding": embedding_value,
+                "ext_rating": product_data.get("rating_avg"),
+                "ext_review_count": product_data.get("rating_count"),
             },
         )
         product_id = cur.fetchone()["id"]
