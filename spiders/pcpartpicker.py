@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 CRAWL_DELAY = 10
 DETAIL_DELAY = 1.0
 
+# Các cột spec cần lấy thêm từ list page (nhanh, không cần vào detail)
+LIST_QUICK_SPECS: dict[str, list[str]] = {
+    "gpu":      ["Chipset", "Memory"],
+    "psu":      ["Wattage"],
+    "ram":      ["Speed", "Modules"],
+}
+
 
 class PCPartPickerSpider(BaseSpider):
     name = "pcpartpicker"
@@ -34,12 +41,12 @@ class PCPartPickerSpider(BaseSpider):
     category_urls = {
         # "cpu": "/products/cpu/specs/",
         # "gpu": "/products/video-card/specs/",
-        # "ram": "/products/memory/specs/",
+        "ram": "/products/memory/specs/",
         # "harddrive": "/products/internal-hard-drive/specs/",
         # "mainboard": "/products/motherboard/specs/",
         # "psu": "/products/power-supply/specs/",
         # "case": "/products/case/specs/",
-        "cooler": "/products/cpu-cooler/specs/",
+        # "cooler": "/products/cpu-cooler/specs/",
         # "monitor": "/products/monitor/specs/",
     }
 
@@ -205,6 +212,10 @@ class PCPartPickerSpider(BaseSpider):
 
                 if page_html:
                     specs = self._parse_specs_bs(page_html)
+                    # Bổ sung quick specs từ list page (detail page ưu tiên hơn)
+                    for k, v in item.get('list_specs', {}).items():
+                        if k not in specs:
+                            specs[k] = v
                     rating_avg, rating_count = self._parse_rating_bs(page_html)
                     img_url = self._parse_img_url_bs(page_html)
                 else:
@@ -303,6 +314,15 @@ class PCPartPickerSpider(BaseSpider):
                         if name_idx == -1:
                             break
 
+                        # Tìm index của các cột quick-spec cần lấy từ list page
+                        quick_spec_names = LIST_QUICK_SPECS.get(category, [])
+                        spec_col_indices: dict[str, int] = {}
+                        for spec_name in quick_spec_names:
+                            for i, h in enumerate(headers):
+                                if h.strip() == spec_name:
+                                    spec_col_indices[spec_name] = i
+                                    break
+
                         page_links_count = 0
                         for row in rows[1:]:
                             cells = row.eles('css:td')
@@ -316,13 +336,30 @@ class PCPartPickerSpider(BaseSpider):
                             name = re.sub(r'\s*\(\d+\)\s*$', '', name).strip()
                             name = ' '.join(name.split())
                             link = name_link.link
-                            if name and link:
-                                detail_urls.append({
-                                    'name': name,
-                                    'detail_url': link,
-                                    'category': category,
-                                })
-                                page_links_count += 1
+                            if not (name and link):
+                                continue
+
+                            # Lấy quick specs từ các cột list page
+                            list_specs: dict[str, str] = {}
+                            for spec_name, col_idx in spec_col_indices.items():
+                                if col_idx < len(cells):
+                                    try:
+                                        cell_text = cells[col_idx].text.strip()
+                                        # Format: "Label\nValue" — lấy dòng cuối
+                                        lines = [l.strip() for l in cell_text.split('\n') if l.strip()]
+                                        val = lines[-1] if len(lines) >= 2 else (lines[0] if lines else '')
+                                        if val and val not in ['—', '-', '']:
+                                            list_specs[spec_name] = val
+                                    except Exception:
+                                        pass
+
+                            detail_urls.append({
+                                'name': name,
+                                'detail_url': link,
+                                'category': category,
+                                'list_specs': list_specs,
+                            })
+                            page_links_count += 1
 
                         logger.info(f'[{self.name}] Trang {page_num}: {page_links_count} links')
                         time.sleep(2)
