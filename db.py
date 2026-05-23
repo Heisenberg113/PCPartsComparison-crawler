@@ -1,10 +1,7 @@
-"""
-Database connection helper for the PC Parts Crawler.
-Cung cấp kết nối PostgreSQL và các helper functions.
-"""
-
 import os
 import json
+import logging
+import time
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from dotenv import load_dotenv
@@ -12,9 +9,11 @@ from embedding.google_embeddings_model import GoogleEmbeddingModelMethod
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 embedder = GoogleEmbeddingModelMethod()
 
-BATCH_SIZE = 50
+_EMBED_DELAY = 0.65       # ~92 req/phút — dưới giới hạn 100/phút của free tier
+_daily_quota_exhausted = True  # True khi hết quota ngày — bỏ qua toàn bộ embedding còn lại
 
 _INSERT_SQL = """
     INSERT INTO products (
@@ -39,31 +38,27 @@ _INSERT_SQL = """
 """
 
 
-def _build_params(product_data: dict) -> dict:
-    text_to_embed = (
+def _make_embed_text(product_data: dict) -> str:
+    return (
         f"{product_data.get('category', '')} "
         f"{product_data.get('brand', '')} "
         f"{product_data.get('name', '')} "
         f"{json.dumps(product_data.get('specs', {}))} "
         f"{product_data.get('description', '')}"
     )
-    try:
-        embedding_value = str(embedder.generate_embedding(text_to_embed))
-    except Exception as e:
-        print(f"Embedding error [{product_data.get('slug', '?')}]: {e}")
-        embedding_value = None
 
+
+def _build_params(product_data: dict, embedding_vec=None) -> dict:
     return {
         **product_data,
         "specs": Json(product_data.get("specs", {})),
-        "embedding": embedding_value,
+        "embedding": str(embedding_vec) if embedding_vec is not None else None,
         "ext_rating": product_data.get("rating_avg"),
         "ext_review_count": product_data.get("rating_count"),
     }
 
 
 def get_connection():
-    """Tạo kết nối tới PostgreSQL database."""
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
@@ -74,31 +69,62 @@ def get_connection():
     )
 
 
-def save_product(conn, product_data: dict) -> int:
-    """Lưu hoặc cập nhật một sản phẩm, commit ngay."""
-    with conn.cursor() as cur:
-        cur.execute(_INSERT_SQL, _build_params(product_data))
-        product_id = cur.fetchone()["id"]
-    conn.commit()
-    return product_id
-
-
 def save_products_batch(conn, products_data: list) -> list[int]:
-    """
-    Lưu một batch sản phẩm trong một transaction duy nhất.
-    Trả về danh sách product_id theo đúng thứ tự input.
-    """
+    """Embed từng sản phẩm với delay rồi lưu cả batch trong một transaction."""
+    global _daily_quota_exhausted
+
     if not products_data:
         return []
 
-    ids = []
-    with conn.cursor() as cur:
-        for product_data in products_data:
-            cur.execute(_INSERT_SQL, _build_params(product_data))
-            res = cur.fetchone()
-            ids.append(res["id"] if res else None)
+    embedding_vectors = []
+    for i, p in enumerate(products_data):
+        if _daily_quota_exhausted:
+            embedding_vectors.append(None)
+            continue
 
-    conn.commit()
+        if i > 0:
+            time.sleep(_EMBED_DELAY)
+
+        try:
+            vec = embedder.generate_embedding(_make_embed_text(p))
+        except Exception as e:
+            err_str = str(e)
+            if 'PerDay' in err_str or 'per_day' in err_str.lower():
+                logger.error("Hết quota embedding theo ngày. Bỏ qua embedding cho phần còn lại.")
+                _daily_quota_exhausted = True
+            else:
+                logger.warning(f"Embedding error [{p.get('slug', '?')}]: {e}")
+            vec = None
+        embedding_vectors.append(vec)
+
+    ok_count = sum(1 for v in embedding_vectors if v is not None)
+    logger.info(f"Embeddings: {ok_count}/{len(products_data)} OK")
+
+    ids = [None] * len(products_data)
+    pairs = list(zip(products_data, embedding_vectors))
+
+    # Thử lưu cả batch trong một transaction
+    try:
+        with conn.cursor() as cur:
+            for idx, (product_data, emb_vec) in enumerate(pairs):
+                cur.execute(_INSERT_SQL, _build_params(product_data, emb_vec))
+                res = cur.fetchone()
+                ids[idx] = res["id"] if res else None
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"Batch save thất bại ({e}), thử lưu từng sản phẩm...")
+        for idx, (product_data, emb_vec) in enumerate(pairs):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(_INSERT_SQL, _build_params(product_data, emb_vec))
+                    res = cur.fetchone()
+                    ids[idx] = res["id"] if res else None
+                conn.commit()
+            except Exception as e2:
+                conn.rollback()
+                logger.error(f"Lỗi lưu [{product_data.get('slug', '?')}]: {e2}")
+
     return ids
 
 
@@ -113,10 +139,3 @@ def save_price(conn, price_data: dict):
             price_data,
         )
     conn.commit()
-
-
-def find_product_by_slug(conn, slug: str):
-    """Tìm sản phẩm theo slug."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM products WHERE slug = %s", (slug,))
-        return cur.fetchone()
